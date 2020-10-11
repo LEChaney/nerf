@@ -1,14 +1,10 @@
 # To run: conda env create -f environment.yml
-name: nerf
+name: nerf_maml
 channels:
     - conda-forge
 dependencies:
-    - python=3.7
-    - pip
-    - cudatoolkit=10.0
-    - tensorflow-gpu==1.15
-    - tensorboard==1.15
-    - tensorflow-estimator==1.15
+    - tensorflow-gpu
+    - tensorboard
     - numpy
     - matplotlib
     - imageio

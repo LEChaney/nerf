@@ -71,7 +71,7 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, re
     
     sfx = ''
     
-    if factor is not None:
+    if factor is not None and factor != 1:
         sfx = '_{}'.format(factor)
         _minify(basedir, factors=[factor])
         factor = factor

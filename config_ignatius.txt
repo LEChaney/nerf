@@ -3,7 +3,7 @@ basedir = ./logs
 datadir = ./data/tanks_and_temples/ignatius
 dataset_type = llff
 
-factor = 4
+factor = 1
 llffhold = 8
 
 no_batching = False
