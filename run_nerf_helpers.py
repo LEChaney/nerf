@@ -133,6 +133,13 @@ def get_rays_from_xy_and_poses(x, y, H, W, focal, poses):
 
 def get_rays(H, W, focal, c2w):
     """Get ray origins, directions from a pinhole camera."""
+    # Assume all images have same dimensions and focal
+    if tf.is_tensor(W):
+        W = tf.cast(W[0], tf.float32)
+    if tf.is_tensor(H):
+        H = tf.cast(H[0], tf.float32) 
+    if tf.is_tensor(focal):
+        focal = focal[0]
     i, j = tf.meshgrid(tf.range(W, dtype=tf.float32),
                        tf.range(H, dtype=tf.float32), indexing='xy')
     dirs = tf.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -tf.ones_like(i)], -1)

@@ -21,7 +21,7 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
         return x
 
     def load_image(image_paths, *passthrough):
-        unique_image_paths, indices = tf.unique(image_paths, out_idx=tf.int64)
+        unique_image_paths, indices = tf.unique(image_paths, out_idx=tf.int32)
         def _load_image(im_path):
             im_file = tf.io.read_file(im_path)
             return tf.image.decode_image(im_file) / 255
@@ -34,7 +34,7 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
         N = tf.shape(image_paths)[0]
 
         # Load images (only load unique images)
-        unique_image_paths, indices = tf.unique(image_paths, out_idx=tf.int64)
+        unique_image_paths, indices = tf.unique(image_paths, out_idx=tf.int32)
         def load_image(im_path):
             im_file = tf.io.read_file(im_path)
             return tf.image.decode_image(im_file) / 255
@@ -42,10 +42,10 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
         # tf.print(tf.shape(unique_images))
 
         # Randomly sample image pixels
-        height = tf.shape(unique_images, out_type=tf.int64)[1]
-        width = tf.shape(unique_images, out_type=tf.int64)[2]
-        y = tf.random.uniform([N], minval=0, maxval=height, dtype=tf.int64)
-        x = tf.random.uniform([N], minval=0, maxval=width, dtype=tf.int64)
+        height = tf.shape(unique_images, out_type=tf.int32)[1]
+        width = tf.shape(unique_images, out_type=tf.int32)[2]
+        y = tf.random.uniform([N], minval=0, maxval=height, dtype=tf.int32)
+        x = tf.random.uniform([N], minval=0, maxval=width, dtype=tf.int32)
         target_rgb = tf.gather_nd(unique_images, tf.stack([indices, y, x], axis=-1))
 
         # Get rays
@@ -60,7 +60,7 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
         return load_llff_data(task_path, factor=None, return_paths_instead_of_img_data=True, spherify=True) #TODO: remove hard coding of arguments
     
     task_path = tf.convert_to_tensor(task_path)
-    img_paths, poses, bds, render_poses, i_test = tf.numpy_function(load_data_wrapper, [task_path], (tf.string, tf.float32, tf.float32, tf.float32, tf.int64))
+    img_paths, poses, bds, render_poses, i_test = tf.numpy_function(load_data_wrapper, [task_path], (tf.string, tf.float32, tf.float32, tf.float32, tf.int32))
 
     if not isinstance(i_test, list):
         i_test = [i_test]
