@@ -11,7 +11,7 @@ import json
 def img2mse(x, y): return tf.reduce_mean(tf.square(x - y))
 
 
-def mse2psnr(x): return -10.*tf.log(x)/tf.log(10.)
+def mse2psnr(x): return -10.*tf.math.log(x)/tf.math.log(10.)
 
 
 def to8b(x): return (255*np.clip(x, 0, 1)).astype(np.uint8)
@@ -119,6 +119,17 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
 
 
 # Ray helpers
+
+def get_rays_from_xy_and_poses(x, y, H, W, focal, poses):
+    c2w = poses[:, :3, :4]
+    x = tf.cast(x, tf.float32)
+    y = tf.cast(y, tf.float32)
+    H = tf.cast(H, tf.float32)
+    W = tf.cast(W, tf.float32)
+    dirs = tf.stack([(x-W*.5)/focal, -(y-H*.5)/focal, -tf.ones_like(x)], -1)
+    rays_d = tf.reduce_sum(dirs[..., np.newaxis, :] * c2w[:, :3, :3], -1)
+    rays_o = tf.broadcast_to(c2w[:, :3, -1], tf.shape(rays_d))
+    return rays_o, rays_d
 
 def get_rays(H, W, focal, c2w):
     """Get ray origins, directions from a pinhole camera."""
