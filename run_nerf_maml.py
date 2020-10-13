@@ -355,8 +355,15 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
     for i, c2w in enumerate(render_poses):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(
-            H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        if tf.is_tensor(H) or isinstance(H, (list, np.ndarray)):
+            cur_render_kwargs = render_kwargs.copy()
+            cur_render_kwargs['near'] = render_kwargs['near'][i]
+            cur_render_kwargs['far'] = render_kwargs['far'][i]
+            rgb, disp, acc, _ = render(
+                H[i], W[i], focal[i], chunk=chunk, c2w=c2w[:3, :4], **cur_render_kwargs)
+        else:
+            rgb, disp, acc, _ = render(
+                H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.numpy())
         disps.append(disp.numpy())
         if i == 0:
@@ -629,14 +636,16 @@ def train():
     train_ds_iter = iter(train_dataset)
     test_ds_iter = iter(test_dataset)
     val_ds_iter = iter(val_dataset)
+    dts = []
     for i in range(start, N_iters):
         time0 = time.time()
 
         # Sample random ray batch
         batch = next(train_ds_iter)
-        batch_rays, target_s, bds, H, W, focal = batch
+        batch_rays, target_s, poses, bds = batch
         batch_rays = tf.transpose(batch_rays, [1, 0, 2])
-        hwf = [H, W, focal]
+        hwf = tf.transpose(poses[:, :3, -1], (1, 0))
+        H, W, focal = hwf
 
         bds_dict = {
             'near': bds[:, 0] * 0.9,
@@ -669,7 +678,7 @@ def train():
         gradients = tape.gradient(loss, grad_vars)
         optimizer.apply_gradients(zip(gradients, grad_vars))
 
-        dt = time.time()-time0
+        dts.append(time.time()-time0)
 
         #####           end            #####
 
@@ -693,8 +702,9 @@ def train():
             }
             render_kwargs_test.update(test_bds_dict)
 
+            render_hwf = tf.transpose(render_poses[:, :3, -1], (1, 0))
             rgbs, disps = render_path(
-                render_poses, hwf, args.chunk, render_kwargs_test)
+                render_poses, render_hwf, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(
                 basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
@@ -706,7 +716,7 @@ def train():
             if args.use_viewdirs:
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
                 rgbs_still, _ = render_path(
-                    render_poses, hwf, args.chunk, render_kwargs_test)
+                    render_poses, render_hwf, args.chunk, render_kwargs_test)
                 render_kwargs_test['c2w_staticcam'] = None
                 imageio.mimwrite(moviebase + 'rgb_still.mp4',
                                  to8b(rgbs_still), fps=30, quality=8)
@@ -718,19 +728,25 @@ def train():
                 'far': test_bds[:, 1],
             }
             render_kwargs_test.update(test_bds_dict)
+            test_hwf = tf.transpose(test_poses[:, :3, -1], (1, 0))
 
             testsavedir = os.path.join(
                 basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', test_poses.shape)
-            render_path(test_poses, hwf, args.chunk, render_kwargs_test,
+            render_path(test_poses, test_hwf, args.chunk, render_kwargs_test,
                         gt_imgs=test_imgs, savedir=testsavedir)
             print('Saved test set')
 
         if i % args.i_print == 0 or i < 10:
-
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
+            # for dt in dts:
+            #     print(f'iter time {dt}')
+            dt_mean = np.mean(np.array(dts))
+            dt_std = np.std(np.array(dts))
+            dts.clear()
+            print(f'iter time mean: {dt_mean}')
+            print(f'iter time std: {dt_std}')
             tf.summary.scalar('loss', loss)
             tf.summary.scalar('psnr', psnr)
             tf.summary.histogram('tran', trans)

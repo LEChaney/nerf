@@ -8,17 +8,21 @@ from run_nerf_helpers import get_rays_from_xy_and_poses
 from load_llff import load_llff_data
 
 def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_every=8):
-    def random_sample_1d(*x):
+    def random_sample_1d(*x, group_same=True):
         # Randomly sample list of image paths with replacement
         N = tf.shape(x[0])[0]
         i_batch = tf.random.uniform([batch_size], minval=0, maxval=N, dtype=tf.int32)
         # Potentially speed up later processing by grouping identical images next to each other.
         # Note that because the task paths are already shuffled, sorting the indices still leaves
         # images in a random order, but wth copies of the same image grouped next to each other.
-        i_batch = tf.sort(i_batch)
+        if group_same:
+            i_batch = tf.sort(i_batch)
         x = tuple(tf.gather(elem, i_batch) for elem in x)
         # tf.print(x)
         return x
+    
+    def random_sample_1d_no_grouping(*x):
+        return random_sample_1d(*x, group_same=False)
 
     def load_image(image_paths, *passthrough):
         unique_image_paths, indices = tf.unique(image_paths, out_idx=tf.int32)
@@ -53,7 +57,7 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
         rays_o, rays_d = get_rays_from_xy_and_poses(x, y, height, width, focal, poses)
         rays = tf.stack([rays_o, rays_d], axis=1)
 
-        return (rays, target_rgb, bounds, tf.repeat(height, N), tf.repeat(width, N), focal)
+        return (rays, target_rgb, poses, bounds)
 
     def load_data_wrapper(task_path):
         task_path = task_path.decode("utf-8")
@@ -88,11 +92,11 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
           .repeat()
           .map(random_sample_1d)
           .unbatch()
-          .batch(512)
+          .batch(20*batch_size)
           .map(load_and_sample_rgb_and_rays)
           .unbatch()
           .batch(batch_size)
-          .prefetch(tf.data.experimental.AUTOTUNE)
+          .prefetch(20)
     ) 
 
     test_poses_ds = tf.data.Dataset.from_tensor_slices(tf.gather(poses, i_test))
@@ -114,7 +118,7 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
     val_ds = (tf.data.Dataset.zip((val_paths_ds, val_poses_ds, val_bds_ds))
                .batch(max_images)
                .repeat()
-               .map(random_sample_1d)
+               .map(random_sample_1d_no_grouping)
                .unbatch()
                .batch(1) # Always sample 1 image for validation
                .map(load_image)
@@ -155,18 +159,20 @@ def get_dataset_of_tasks(tasks_dir, meta_batch_size=6, task_batch_size=1024, max
     return ds
 
 
-# ds = get_dataset_for_task('E:/tanks-and-temples/image_sets/Ballroom/')
-# # ds = get_dataset_of_tasks('E:/nerf/data/tanks_and_temples')
+# train_ds, test_ds, val_ds = get_dataset_for_task('data/tanks_and_temples/Ignatius', batch_size=2048)
+# # # ds = get_dataset_of_tasks('E:/nerf/data/tanks_and_temples')
+
+
 
 # before = time.time()
-# for x in ds:
+# for x in train_ds:
 #     # print(x.shape)
 
 #     after = time.time()
 #     dt = after - before
 #     print(dt)
 
-#     # time.sleep(3)
+#     time.sleep(0.36542)
 
 #     before = time.time()
 #     # plt.imshow(x)
