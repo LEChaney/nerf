@@ -581,18 +581,22 @@ def config_parser():
     # Meta Learning options
     parser.add_argument("--meta_batch_size", type=int, default=6,
                         help='number of imagesets to train on in parallel')
-    parser.add_argument("--N_meta_updates", type=int, default=5,
+    parser.add_argument("--N_inner_steps", type=int, default=5,
                         help='number of specialization steps to perform')
+    parser.add_argument("--meta_lrate", type=float, default=0.25,
+                        help='learning rate for meta learning step')
 
     return parser
 
-
-def task_metalearn(task_id, task_ds_iters, args, render_kwargs, grad_vars):
+def task_metalearn(task_id, task_ds_iters, args, render_kwargs, grad_vars, optimizer):
     task_ds_iter = task_ds_iters[task_id]
 
-    for i in range(args.N_meta_updates):
+    psnr0 = None
+    for _ in range(args.N_inner_steps):
         # Sample random ray batch
+        # start_time = time.time()
         batch = next(task_ds_iter)
+        # print(f'Batch Time: {time.time() - start_time}')
         batch_rays, target_s, poses, bds = batch
         batch_rays = tf.transpose(batch_rays, [1, 0, 2])
         hwf = tf.transpose(poses[:, :3, -1], (1, 0))
@@ -624,12 +628,22 @@ def task_metalearn(task_id, task_ds_iters, args, render_kwargs, grad_vars):
                 loss += img_loss0
                 psnr0 = mse2psnr(img_loss0)
 
-        gradients = tape.gradient(loss, grad_vars)
-        for i in range(len(grad_vars)):
-            grad_vars[i].assign(grad_vars[i] - 1e-3 * gradients[i])
-        # optimizer.apply_gradients(zip(gradients, grad_vars))
+            print(loss)
 
-    return loss
+        gradients = tape.gradient(loss, grad_vars)
+        optimizer.apply_gradients(zip(gradients, grad_vars))
+
+    return loss, psnr, trans, psnr0
+
+def set_vars(vars, values):
+    for i, var in enumerate(vars):
+        var.assign(values[i])
+
+def copy_vars(vars):
+    copy = []
+    for var in vars:
+        copy.append(tf.identity(var))
+    return copy
 
 def train():
 
@@ -647,7 +661,11 @@ def train():
 
     train_ds_iters, test_ds_iters, val_ds_iters = get_task_ds_iters(args.datadir, batch_size=args.N_rand, holdout_every=args.llffhold)
     num_tasks = len(train_ds_iters)
-    task_id_ds = tf.data.Dataset.range(num_tasks).repeat().shuffle(num_tasks).batch(args.meta_batch_size)
+    test_task_ids = np.arange(num_tasks)[::args.llffhold] # TODO Make number of test_task_ids independent
+    train_task_ids = np.array([i for i in np.arange(num_tasks) if i not in test_task_ids])
+    train_task_id_ds = tf.data.Dataset.from_tensor_slices(train_task_ids).repeat().shuffle(len(train_task_ids)).batch(args.meta_batch_size)
+    test_task_id_ds = tf.data.Dataset.from_tensor_slices(test_task_ids).repeat().shuffle(len(test_task_ids))
+    test_task_id_iter = iter(test_task_id_ds)
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -669,10 +687,10 @@ def train():
 
     # Create optimizer
     lrate = args.lrate
-    if args.lrate_decay > 0:
-        lrate = tf.keras.optimizers.schedules.ExponentialDecay(lrate,
-                                                               decay_steps=args.lrate_decay * 1000, decay_rate=0.1)
-    optimizer = tf.keras.optimizers.Adam(lrate)
+    # if args.lrate_decay > 0:
+    #     lrate = tf.keras.optimizers.schedules.ExponentialDecay(lrate,
+    #                                                            decay_steps=args.lrate_decay * 1000, decay_rate=0.1)
+    optimizer = tf.keras.optimizers.Adam(lrate, beta_1=0)
     models['optimizer'] = optimizer
 
     global_step = tf.compat.v1.train.get_or_create_global_step()
@@ -686,16 +704,117 @@ def train():
         os.path.join(basedir, 'summaries', expname))
     writer.set_as_default()
     
-    metalearn_fn = lambda task_id: task_metalearn(task_id, train_ds_iters, args, render_kwargs_train, grad_vars)
-    task_ids_iter = iter(task_id_ds)
+    metalearn_fn = lambda task_id: task_metalearn(task_id, train_ds_iters, args, render_kwargs_train, grad_vars, optimizer)
+    task_ids_iter = iter(train_task_id_ds)
     for i in range(start, N_iters):
         task_id_batch = next(task_ids_iter)
 
-        with tf.GradientTape() as tape:
-            loss = tf.map_fn(metalearn_fn, elems=(task_id_batch), dtype=tf.float32, parallel_iterations=args.meta_batch_size)
-        
-        gradients = tape.gradient(loss, grad_vars)
-        optimizer.apply_gradients(zip(gradients, grad_vars))
+        losses = []
+        psnrs = []
+        psnr0s = []
+        var_update = [tf.zeros_like(grad_var) for grad_var in grad_vars]
+        for j in range(args.meta_batch_size):
+            # Save model variables
+            old_model_vars = copy_vars(grad_vars)
+
+            # Inner training loop (specialize model for task)
+            loss, psnr, trans, psnr0 = metalearn_fn(task_id_batch[j])
+
+            # Record difference between old and new model variables
+            for k in range(len(var_update)):
+                var_update[k] += grad_vars[k] - old_model_vars[k]
+
+            # Reset model variables
+            set_vars(grad_vars, old_model_vars)
+
+            # Record final losses for logging
+            losses.append(loss)
+            psnrs.append(psnr)
+            if psnr0:
+                psnr0s.append(psnr0)
+
+        # Meta learning update step
+        for k in range(len(var_update)):
+            var_update[k] = old_model_vars[k] + args.meta_lrate / args.meta_batch_size * var_update[k]
+        set_vars(grad_vars, var_update)
+
+         #####           end            #####
+
+        # Rest is logging
+
+        meta_batch_loss = tf.reduce_mean(losses)
+        meta_batch_psnr = tf.reduce_mean(psnrs)
+        if psnr0s:
+            meta_batch_psnr0 = tf.reduce_mean(psnr0s)
+
+        def save_weights(net, prefix, i):
+            path = os.path.join(
+                basedir, expname, '{}_{:06d}.npy'.format(prefix, i))
+            np.save(path, net.get_weights())
+            print('saved weights at', path)
+
+        if i % args.i_weights == 0:
+            for k in models:
+                save_weights(models[k], k, i)
+
+        if i % args.i_print == 0 or i < 10:
+            print(expname, i, meta_batch_psnr.numpy(), meta_batch_loss.numpy(), global_step.numpy())
+            tf.summary.scalar('meta_batch_loss', meta_batch_loss)
+            tf.summary.scalar('meta_batch_psnr', meta_batch_psnr)
+            tf.summary.histogram('tran', trans)
+            if args.N_importance > 0:
+                tf.summary.scalar('meta_batch_psnr0', meta_batch_psnr0)
+
+        # if i % args.i_img == 0:
+        #     # Run metalearning step on the validation image set
+        #     test_task_id = next(test_task_id_iter)
+        #     metalearn_fn(test_task_id)
+
+        #     # Log a rendered validation view to Tensorboard
+        #     val_target, val_pose, val_bd = next(val_ds_iters[test_task_id])
+        #     val_target = tf.squeeze(val_target)
+        #     val_pose = tf.squeeze(val_pose)
+        #     val_bd = tf.squeeze(val_bd)
+
+        #     val_bds_dict = {
+        #         'near': val_bd[0] * 0.9,
+        #         'far': val_bd[1],
+        #     }
+        #     render_kwargs_test.update(val_bds_dict)
+
+        #     H = val_pose[0, -1]
+        #     W = val_pose[1, -1]
+        #     focal = val_pose[2, -1]
+        #     c2w = val_pose[:3, :4]
+
+        #     rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=c2w,
+        #                                     **render_kwargs_test)
+
+        #     psnr = mse2psnr(img2mse(rgb, val_target))
+            
+        #     # Save out the validation image for Tensorboard-free monitoring
+        #     testimgdir = os.path.join(basedir, expname, 'tboard_val_imgs')
+        #     if i==0:
+        #         os.makedirs(testimgdir, exist_ok=True)
+        #     imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
+
+        #     tf.summary.image('rgb', to8b(rgb)[tf.newaxis])
+        #     tf.summary.image(
+        #         'disp', disp[tf.newaxis, ..., tf.newaxis])
+        #     tf.summary.image(
+        #         'acc', acc[tf.newaxis, ..., tf.newaxis])
+
+        #     tf.summary.scalar('psnr_holdout', psnr)
+        #     tf.summary.image('rgb_holdout', val_target[tf.newaxis])
+
+        #     if args.N_importance > 0:
+
+        #         tf.summary.image(
+        #             'rgb0', to8b(extras['rgb0'])[tf.newaxis])
+        #         tf.summary.image(
+        #             'disp0', extras['disp0'][tf.newaxis, ..., tf.newaxis])
+        #         tf.summary.image(
+        #             'z_std', extras['z_std'][tf.newaxis, ..., tf.newaxis])
 
         global_step.assign_add(1)
 

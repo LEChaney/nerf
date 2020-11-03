@@ -12,7 +12,7 @@ from run_nerf_helpers import *
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
-from input_pipeline import get_task_ds_iters
+from input_pipeline import get_dataset_for_task, get_num_task_datasets
 
 tf.compat.v1.enable_eager_execution()
 
@@ -578,58 +578,8 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
 
-    # Meta Learning options
-    parser.add_argument("--meta_batch_size", type=int, default=6,
-                        help='number of imagesets to train on in parallel')
-    parser.add_argument("--N_meta_updates", type=int, default=5,
-                        help='number of specialization steps to perform')
-
     return parser
 
-
-def task_metalearn(task_id, task_ds_iters, args, render_kwargs, grad_vars):
-    task_ds_iter = task_ds_iters[task_id]
-
-    for i in range(args.N_meta_updates):
-        # Sample random ray batch
-        batch = next(task_ds_iter)
-        batch_rays, target_s, poses, bds = batch
-        batch_rays = tf.transpose(batch_rays, [1, 0, 2])
-        hwf = tf.transpose(poses[:, :3, -1], (1, 0))
-        H, W, focal = hwf
-        bds_dict = {
-            'near': bds[:, 0] * 0.9,
-            'far': bds[:, 1],
-        }
-        render_kwargs.update(bds_dict)
-
-        #####  Core optimization loop  #####
-
-        with tf.GradientTape() as tape:
-
-            # Make predictions for color, disparity, accumulated opacity.
-            rgb, disp, acc, extras = render(
-                H, W, focal, chunk=args.chunk, rays=batch_rays,
-                verbose=False, retraw=True, **render_kwargs)
-
-            # Compute MSE loss between predicted and true RGB.
-            img_loss = img2mse(rgb, target_s)
-            trans = extras['raw'][..., -1]
-            loss = img_loss
-            psnr = mse2psnr(img_loss)
-
-            # Add MSE loss for coarse-grained model
-            if 'rgb0' in extras:
-                img_loss0 = img2mse(extras['rgb0'], target_s)
-                loss += img_loss0
-                psnr0 = mse2psnr(img_loss0)
-
-        gradients = tape.gradient(loss, grad_vars)
-        for i in range(len(grad_vars)):
-            grad_vars[i].assign(grad_vars[i] - 1e-3 * gradients[i])
-        # optimizer.apply_gradients(zip(gradients, grad_vars))
-
-    return loss
 
 def train():
 
@@ -644,10 +594,7 @@ def train():
     # Load data
     # num_tasks = get_num_task_datasets(args.datadir)
     # task_datasets = [None] * num_tasks
-
-    train_ds_iters, test_ds_iters, val_ds_iters = get_task_ds_iters(args.datadir, batch_size=args.N_rand, holdout_every=args.llffhold)
-    num_tasks = len(train_ds_iters)
-    task_id_ds = tf.data.Dataset.range(num_tasks).repeat().shuffle(num_tasks).batch(args.meta_batch_size)
+    train_dataset, test_dataset, val_dataset = get_dataset_for_task(args.datadir, batch_size=args.N_rand, holdout_every=args.llffhold)
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -686,16 +633,168 @@ def train():
         os.path.join(basedir, 'summaries', expname))
     writer.set_as_default()
     
-    metalearn_fn = lambda task_id: task_metalearn(task_id, train_ds_iters, args, render_kwargs_train, grad_vars)
-    task_ids_iter = iter(task_id_ds)
+    train_ds_iter = iter(train_dataset)
+    test_ds_iter = iter(test_dataset)
+    val_ds_iter = iter(val_dataset)
+    dts = []
     for i in range(start, N_iters):
-        task_id_batch = next(task_ids_iter)
+        time0 = time.time()
+
+        # Sample random ray batch
+        batch = next(train_ds_iter)
+        batch_rays, target_s, poses, bds = batch
+        batch_rays = tf.transpose(batch_rays, [1, 0, 2])
+        hwf = tf.transpose(poses[:, :3, -1], (1, 0))
+        H, W, focal = hwf
+
+        bds_dict = {
+            'near': bds[:, 0] * 0.9,
+            'far': bds[:, 1],
+        }
+        render_kwargs_train.update(bds_dict)
+        # render_kwargs_test.update(bds_dict)
+
+        #####  Core optimization loop  #####
 
         with tf.GradientTape() as tape:
-            loss = tf.map_fn(metalearn_fn, elems=(task_id_batch), dtype=tf.float32, parallel_iterations=args.meta_batch_size)
-        
+
+            # Make predictions for color, disparity, accumulated opacity.
+            rgb, disp, acc, extras = render(
+                H, W, focal, chunk=args.chunk, rays=batch_rays,
+                verbose=i < 10, retraw=True, **render_kwargs_train)
+
+            # Compute MSE loss between predicted and true RGB.
+            img_loss = img2mse(rgb, target_s)
+            trans = extras['raw'][..., -1]
+            loss = img_loss
+            psnr = mse2psnr(img_loss)
+
+            # Add MSE loss for coarse-grained model
+            if 'rgb0' in extras:
+                img_loss0 = img2mse(extras['rgb0'], target_s)
+                loss += img_loss0
+                psnr0 = mse2psnr(img_loss0)
+
         gradients = tape.gradient(loss, grad_vars)
         optimizer.apply_gradients(zip(gradients, grad_vars))
+
+        dts.append(time.time()-time0)
+
+        #####           end            #####
+
+        # Rest is logging
+
+        def save_weights(net, prefix, i):
+            path = os.path.join(
+                basedir, expname, '{}_{:06d}.npy'.format(prefix, i))
+            np.save(path, net.get_weights())
+            print('saved weights at', path)
+
+        if i % args.i_weights == 0:
+            for k in models:
+                save_weights(models[k], k, i)
+
+        if i % args.i_video == 0 and i > 0:
+            test_imgs, test_poses, render_poses, test_bds = next(test_ds_iter)
+            test_bds_dict = {
+                'near': test_bds[:, 0] * 0.9,
+                'far': test_bds[:, 1],
+            }
+            render_kwargs_test.update(test_bds_dict)
+
+            render_hwf = tf.transpose(render_poses[:, :3, -1], (1, 0))
+            rgbs, disps = render_path(
+                render_poses, render_hwf, args.chunk, render_kwargs_test)
+            print('Done, saving', rgbs.shape, disps.shape)
+            moviebase = os.path.join(
+                basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
+            imageio.mimwrite(moviebase + 'rgb.mp4',
+                             to8b(rgbs), fps=30, quality=8)
+            imageio.mimwrite(moviebase + 'disp.mp4',
+                             to8b(disps / np.max(disps)), fps=30, quality=8)
+
+            if args.use_viewdirs:
+                render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
+                rgbs_still, _ = render_path(
+                    render_poses, render_hwf, args.chunk, render_kwargs_test)
+                render_kwargs_test['c2w_staticcam'] = None
+                imageio.mimwrite(moviebase + 'rgb_still.mp4',
+                                 to8b(rgbs_still), fps=30, quality=8)
+
+        if i % args.i_testset == 0 and i > 0:
+            test_imgs, test_poses, render_poses, test_bds = next(test_ds_iter)
+            test_bds_dict = {
+                'near': test_bds[:, 0] * 0.9,
+                'far': test_bds[:, 1],
+            }
+            render_kwargs_test.update(test_bds_dict)
+            test_hwf = tf.transpose(test_poses[:, :3, -1], (1, 0))
+
+            testsavedir = os.path.join(
+                basedir, expname, 'testset_{:06d}'.format(i))
+            os.makedirs(testsavedir, exist_ok=True)
+            print('test poses shape', test_poses.shape)
+            render_path(test_poses, test_hwf, args.chunk, render_kwargs_test,
+                        gt_imgs=test_imgs, savedir=testsavedir)
+            print('Saved test set')
+
+        if i % args.i_print == 0 or i < 10:
+            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+            # for dt in dts:
+            #     print(f'iter time {dt}')
+            dt_mean = np.mean(np.array(dts))
+            dt_std = np.std(np.array(dts))
+            dts.clear()
+            print(f'iter time mean: {dt_mean}')
+            print(f'iter time std: {dt_std}')
+            tf.summary.scalar('loss', loss)
+            tf.summary.scalar('psnr', psnr)
+            tf.summary.histogram('tran', trans)
+            if args.N_importance > 0:
+                tf.summary.scalar('psnr0', psnr0)
+
+            if i % args.i_img == 0:
+                # Log a rendered validation view to Tensorboard
+                val_target, val_pose, val_bd = next(val_ds_iter)
+                val_target = tf.squeeze(val_target)
+                val_pose = tf.squeeze(val_pose)
+                val_bd = tf.squeeze(val_bd)
+
+                val_bds_dict = {
+                    'near': val_bd[0] * 0.9,
+                    'far': val_bd[1],
+                }
+                render_kwargs_test.update(val_bds_dict)
+                val_pose = val_pose[:3, :4]
+
+                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=val_pose,
+                                                **render_kwargs_test)
+
+                psnr = mse2psnr(img2mse(rgb, val_target))
+                
+                # Save out the validation image for Tensorboard-free monitoring
+                testimgdir = os.path.join(basedir, expname, 'tboard_val_imgs')
+                if i==0:
+                    os.makedirs(testimgdir, exist_ok=True)
+                imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
+
+                tf.summary.image('rgb', to8b(rgb)[tf.newaxis])
+                tf.summary.image(
+                    'disp', disp[tf.newaxis, ..., tf.newaxis])
+                tf.summary.image(
+                    'acc', acc[tf.newaxis, ..., tf.newaxis])
+
+                tf.summary.scalar('psnr_holdout', psnr)
+                tf.summary.image('rgb_holdout', val_target[tf.newaxis])
+
+                if args.N_importance > 0:
+
+                    tf.summary.image(
+                        'rgb0', to8b(extras['rgb0'])[tf.newaxis])
+                    tf.summary.image(
+                        'disp0', extras['disp0'][tf.newaxis, ..., tf.newaxis])
+                    tf.summary.image(
+                        'z_std', extras['z_std'][tf.newaxis, ..., tf.newaxis])
 
         global_step.assign_add(1)
 

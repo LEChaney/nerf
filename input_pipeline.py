@@ -7,7 +7,7 @@ from run_nerf_helpers import get_rays_from_xy_and_poses
 
 from load_llff import load_llff_data
 
-def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_every=8):
+def get_dataset_for_task(task_path, batch_size=1024, max_images_per_task=10000, holdout_every=8):
     def random_sample_1d(*x, group_same=True):
         # Randomly sample list of image paths with replacement
         N = tf.shape(x[0])[0]
@@ -38,7 +38,7 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
         N = tf.shape(image_paths)[0]
 
         # Load images (only load unique images)
-        unique_image_paths, indices = tf.unique(image_paths, out_idx=tf.int32)
+        unique_image_paths, indices = tf.unique(image_paths, out_idx=tf.int64)
         def load_image(im_path):
             im_file = tf.io.read_file(im_path)
             return tf.image.decode_image(im_file) / 255
@@ -46,10 +46,10 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
         # tf.print(tf.shape(unique_images))
 
         # Randomly sample image pixels
-        height = tf.shape(unique_images, out_type=tf.int32)[1]
-        width = tf.shape(unique_images, out_type=tf.int32)[2]
-        y = tf.random.uniform([N], minval=0, maxval=height, dtype=tf.int32)
-        x = tf.random.uniform([N], minval=0, maxval=width, dtype=tf.int32)
+        height = tf.shape(unique_images, out_type=tf.int64)[1]
+        width = tf.shape(unique_images, out_type=tf.int64)[2]
+        y = tf.random.uniform([N], minval=0, maxval=height, dtype=tf.int64)
+        x = tf.random.uniform([N], minval=0, maxval=width, dtype=tf.int64)
         target_rgb = tf.gather_nd(unique_images, tf.stack([indices, y, x], axis=-1))
 
         # Get rays
@@ -88,7 +88,7 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
     paths_ds = tf.data.Dataset.from_tensor_slices(tf.gather(img_paths, i_train))
 
     train_ds = (tf.data.Dataset.zip((paths_ds, poses_ds, bds_ds))
-          .batch(max_images)
+          .batch(max_images_per_task)
           .repeat()
           .map(random_sample_1d)
           .unbatch()
@@ -116,7 +116,7 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
     val_paths_ds = tf.data.Dataset.from_tensor_slices(tf.gather(img_paths, i_val))
 
     val_ds = (tf.data.Dataset.zip((val_paths_ds, val_poses_ds, val_bds_ds))
-               .batch(max_images)
+               .batch(max_images_per_task)
                .repeat()
                .map(random_sample_1d_no_grouping)
                .unbatch()
@@ -127,36 +127,50 @@ def get_dataset_for_task(task_path, batch_size=1024, max_images=10000, holdout_e
     
     return train_ds, test_ds, val_ds
 
+def get_task_ds_iters(tasks_dir, batch_size=1024, max_images_per_task=10000, holdout_every=8):
+    task_paths = glob.glob(os.path.join(tasks_dir, '*/'))
+    train_ds_iters = []
+    test_ds_iters = []
+    val_ds_iters = []
+    for task_path in task_paths:
+        train_ds, test_ds, val_ds = get_dataset_for_task(task_path, batch_size=batch_size, max_images_per_task=max_images_per_task, holdout_every=holdout_every)
+        train_ds_iter, test_ds_iter, val_ds_iter = iter(train_ds), iter(test_ds), iter(val_ds)
+        train_ds_iters.append(train_ds_iter)
+        test_ds_iters.append(test_ds_iter)
+        val_ds_iters.append(val_ds_iter)
+
+    return train_ds_iters, test_ds_iters, val_ds_iters
+
 def get_num_task_datasets(tasks_dir):
     task_paths = glob.glob(os.path.join(tasks_dir, '*/'))
     num_tasks = len(task_paths)
     return num_tasks
 
 
-def get_dataset_of_tasks(tasks_dir, meta_batch_size=6, task_batch_size=1024, max_images_per_task=10000):
+# def get_dataset_of_tasks(tasks_dir, meta_batch_size=6, task_batch_size=1024, max_images_per_task=10000):
 
-    task_paths = glob.glob(os.path.join(tasks_dir, '*/'))
-    num_tasks = len(task_paths)
-    dataset_iters = []
-    for task_path in task_paths:
-        dataset_iters.append(iter(get_dataset_for_task(task_path, batch_size=task_batch_size, max_images=max_images_per_task)))
+#     task_paths = glob.glob(os.path.join(tasks_dir, '*/'))
+#     num_tasks = len(task_paths)
+#     dataset_iters = []
+#     for task_path in task_paths:
+#         dataset_iters.append(iter(get_dataset_for_task(task_path, batch_size=task_batch_size, max_images_per_task=max_images_per_task)))
     
-    def next_elem_from_dataset(i):
-        i = tf.convert_to_tensor(i)
-        def _numpy_wrapper(i):
-            _next = next(dataset_iters[i])
-            # print(f'Read from dataset {i}')
-            return _next
-        _next = tuple(tf.numpy_function(_numpy_wrapper, [i], (tf.float32, tf.float32, tf.float32)))
-        return _next
+#     def next_elem_from_dataset(i):
+#         i = tf.convert_to_tensor(i)
+#         def _numpy_wrapper(i):
+#             _next = next(dataset_iters[i])
+#             # print(f'Read from dataset {i}')
+#             return _next
+#         _next = tuple(tf.numpy_function(_numpy_wrapper, [i], (tf.float32, tf.float32, tf.float32)))
+#         return _next
     
-    ds = (tf.data.Dataset.range(num_tasks)
-          .repeat()
-          .map(next_elem_from_dataset)
-          .batch(meta_batch_size)
-          .prefetch(tf.data.experimental.AUTOTUNE)
-    )
-    return ds
+#     ds = (tf.data.Dataset.range(num_tasks)
+#           .repeat()
+#           .map(next_elem_from_dataset)
+#           .batch(meta_batch_size)
+#           .prefetch(tf.data.experimental.AUTOTUNE)
+#     )
+#     return ds
 
 
 # train_ds, test_ds, val_ds = get_dataset_for_task('data/tanks_and_temples/Ignatius', batch_size=2048)

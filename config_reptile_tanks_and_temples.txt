@@ -1,0 +1,29 @@
+expname = tanks_and_temples
+basedir = ./logs
+datadir = ./data/tanks_and_temples/
+dataset_type = llff
+
+factor = 1
+llffhold = 8
+
+no_batching = False
+
+use_viewdirs = True
+lrate_decay = 250
+raw_noise_std = 1.0
+
+N_samples = 2048
+N_importance = 128
+N_rand = 128
+
+no_ndc = True
+spherify = True
+lindisp = True
+
+meta_batch_size = 1
+N_inner_steps = 10
+meta_lrate = 1e-2
+lrate = 5e-4
+
+i_img = 100
+i_print = 1
